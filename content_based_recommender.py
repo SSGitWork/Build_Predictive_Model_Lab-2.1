@@ -31,7 +31,7 @@ props1 = pd.read_csv("data/item_properties_part1.csv")
 props2 = pd.read_csv("data/item_properties_part2.csv")
 
 # TODO: Combine props1 and props2 vertically into a unified dataframe named 'props'
-props = None
+props = pd.concat([props1, props2], ignore_index=True)
 
 print(f"    Total property records : {len(props) if props is not None else 0:,}")
 print(f"    Unique items           : {props['itemid'].nunique() if props is not None else 0:,}")
@@ -45,12 +45,33 @@ print("\n[2] Building item documents from properties...")
 
 # TODO: Deduplicate properties to keep only the most recent snapshot of each item-property pair.
 # Hint: Sort 'props' by 'timestamp' descending, then use drop_duplicates across ['itemid', 'property']
-props_latest = None
+props_latest = (
+    props
+    .sort_values('timestamp', ascending=False)
+    .drop_duplicates(subset=['itemid', 'property'], keep='first')
+    .copy()
+)
 
 # TODO: Transform property values into tokens and concatenate them per item into a single string document
-# Hint: Group 'props_latest' by 'itemid', extract the 'value' column, and apply a lambda or string 
+# Hint: Group 'props_latest' by 'itemid', extract the 'value' column, and apply a lambda or string
 # transformation to lowercase values, replace spaces with underscores, and ' '.join() them.
-item_docs = None
+props_latest['value_token'] = (
+    props_latest['value']
+    .fillna('')
+    .astype(str)
+    .str.lower()
+    .str.replace(r'\s+', '_', regex=True)
+)
+
+item_docs = (
+    props_latest
+    .groupby('itemid')['value_token']
+    .apply(lambda values: ' '.join(token for token in values if token.strip()))
+    .reset_index(name='document')
+)
+
+# Remove items with an empty document, since TF-IDF cannot learn from them.
+item_docs = item_docs[item_docs['document'].str.strip() != ''].reset_index(drop=True)
 
 print(f"    Items with documents   : {len(item_docs) if item_docs is not None else 0:,}")
 
@@ -62,13 +83,19 @@ print("\n[3] Building TF-IDF matrix...")
 
 # TODO: Instantiate a TfidfVectorizer object to convert item text documents into numerical profiles.
 # Hyperparameters: max_features=5000, min_df=2, max_df=0.95, ngram_range=(1, 2), sublinear_tf=True
-vectorizer = None
+vectorizer = TfidfVectorizer(
+    max_features=5000,
+    min_df=2,
+    max_df=0.95,
+    ngram_range=(1, 2),
+    sublinear_tf=True
+)
 
 # TODO: Fit the vectorizer on the item_docs['document'] column and transform the text into a sparse TF-IDF matrix
-tfidf_matrix = None
+tfidf_matrix = vectorizer.fit_transform(item_docs['document'])
 
 # TODO: Extract the raw array of unique item IDs from item_docs['itemid'] for index-to-ID mappings
-item_ids = None
+item_ids = item_docs['itemid'].values
 
 print(f"    TF-IDF matrix shape    : {tfidf_matrix.shape if tfidf_matrix is not None else 'N/A'}")
 print(f"    Vocabulary size        : {len(vectorizer.vocabulary_):,} terms" if vectorizer is not None else "N/A")
@@ -85,25 +112,30 @@ def get_similar_items(item_id, tfidf_matrix, item_ids, top_k=10):
     Returns a pandas DataFrame containing 'item_id' and 'similarity' columns.
     """
     # TODO: Verify if item_id exists in our catalog array (item_ids). If not, print warning and return empty DataFrame.
-    if False:  # Replace with actual inclusion check
-        return pd.DataFrame()
+    if item_id not in item_ids:
+        print(f"    Warning: Item ID {item_id} is not available in the metadata catalog.")
+        return pd.DataFrame(columns=['item_id', 'similarity'])
 
     # TODO: Extract the exact row coordinate index matching the query item_id inside your item_ids list
-    idx = None
+    idx = np.where(item_ids == item_id)[0][0]
 
     # TODO: Isolate the row vector from tfidf_matrix at index 'idx'
-    item_vector = None
-    
+    item_vector = tfidf_matrix[idx]
+
     # TODO: Calculate the cosine similarity matrix between the isolated item_vector and the full tfidf_matrix.
     # Hint: Use cosine_similarity(item_vector, tfidf_matrix) and flatten the resulting 2D output array into a 1D array.
-    similarities = None
+    similarities = cosine_similarity(item_vector, tfidf_matrix).flatten()
 
     # TODO: Sort similarities in descending order and identify indices of the top_k most similar items.
     # Note: Exclude the first item itself (as similarity with itself equals 1.0) by slicing [1:top_k+1]
-    top_indices = None
+    top_indices = np.argsort(similarities)[::-1][1:top_k + 1]
 
     # TODO: Build and return a pandas DataFrame mapping calculated values to 'item_id' and 'similarity' keys
-    results = pd.DataFrame()
+    results = pd.DataFrame({
+        'item_id': item_ids[top_indices],
+        'similarity': similarities[top_indices]
+    })
+
     return results
 
 
@@ -115,9 +147,15 @@ print("\n[5] Testing content-based recommender...")
 if item_ids is not None and tfidf_matrix is not None:
     sample_item = item_ids[100]
     print(f"    Query item ID: {sample_item}")
-    
+
     # TODO: Call your get_similar_items function to find the top 10 matches for sample_item
-    recommendations = None
+    recommendations = get_similar_items(
+        sample_item,
+        tfidf_matrix,
+        item_ids,
+        top_k=10
+    )
+
     print(recommendations.to_string(index=False) if recommendations is not None else "    Not Implemented")
 
 
@@ -129,16 +167,24 @@ print("\n[6] Evaluating with purchase data...")
 events = pd.read_csv("data/events.csv")
 
 # TODO: Filter events down to 'transaction' occurrences only and pull out ['visitorid', 'itemid']
-purchases = None
+purchases = (
+    events[events['event'] == 'transaction']
+    .sort_values('timestamp')
+    [['visitorid', 'itemid']]
+    .copy()
+)
+
 if purchases is not None:
     purchases.columns = ['user_id', 'item_id']
 
 # TODO: Isolate sequential multi-purchase records by keeping users with 2 or more historical purchases
-multi_buyers = None
+multi_buyers = purchases[
+    purchases.groupby('user_id')['item_id'].transform('size') >= 2
+].copy()
 
 # Evaluation loops over 500 multi-purchase buyers
 hits_at_10 = 0
-total_eval  = 0
+total_eval = 0
 
 if multi_buyers is not None:
     eval_users = multi_buyers['user_id'].unique()[:500]
@@ -151,27 +197,36 @@ if multi_buyers is not None:
         if len(catalog_items) < 2:
             continue
 
-        query_item  = catalog_items[0]
+        query_item = catalog_items[0]
         target_item = catalog_items[1]
 
         # TODO: Retrieve the top 10 recommended items for the query_item using your get_similar_items framework
-        recs = None
+        recs = get_similar_items(
+            query_item,
+            tfidf_matrix,
+            item_ids,
+            top_k=10
+        )
+
         if recs is None or len(recs) == 0:
             continue
 
         # TODO: Check if target_item exists inside the recommended item list. If yes, increment hits_at_10.
         # Increment total_eval counters for each user evaluation run completed.
-        pass
+        if target_item in recs['item_id'].values:
+            hits_at_10 += 1
+
+        total_eval += 1
 
 # TODO: Calculate precision_at_10 by dividing hits_at_10 by total_eval
-precision_at_10 = 0.0
+precision_at_10 = hits_at_10 / total_eval if total_eval > 0 else 0.0
 
 print(f"\n    Evaluated on {total_eval} users")
 print(f"    Hits@10     : {hits_at_10}")
 print(f"    Precision@10: {precision_at_10:.4f}")
 
 cb_results = {
-    'model'          : 'Content-Based (TF-IDF)',
+    'model': 'Content-Based (TF-IDF)',
     'precision_at_10': precision_at_10,
     'evaluated_users': total_eval
 }
@@ -184,11 +239,30 @@ print("\n[7] Visualizing similarity distribution...")
 
 # --- Plotting Baseline Profiles ---
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-fig.suptitle("Lab 2.1: Content-Based Recommender — TF-IDF Analysis", fontsize=13, fontweight='bold')
+fig.suptitle(
+    "Lab 2.1: Content-Based Recommender — TF-IDF Analysis",
+    fontsize=13,
+    fontweight='bold'
+)
 
 # TODO: Render a histogram on axes[0] illustrating raw cosine similarities calculated from an item against the catalog array
 # Hint: Use axes[0].hist(all_sims, bins=50)
+reference_item = item_ids[100]
+reference_idx = np.where(item_ids == reference_item)[0][0]
 
+comparison_size = min(1000, len(item_ids))
+all_sims = cosine_similarity(
+    tfidf_matrix[reference_idx],
+    tfidf_matrix[:comparison_size]
+).flatten()
+
+axes[0].hist(
+    all_sims,
+    bins=50,
+    color='#4C72B0',
+    edgecolor='white',
+    alpha=0.9
+)
 
 axes[0].set_title("Cosine Similarity Distribution\n(Reference item vs 1000 items)")
 axes[0].set_xlabel("Cosine Similarity Score")
@@ -197,7 +271,21 @@ axes[0].set_ylabel("Number of Items")
 # --- Plotting Document Feature Weights ---
 # TODO: Calculate top terms for a sample document by sorting vocabulary feature weights extracted from tfidf_matrix rows
 # Plot top 15 weights as a horizontal bar plot on axes[1] using ax.barh()
+feature_names = vectorizer.get_feature_names_out()
+sample_vector = tfidf_matrix[reference_idx].toarray().flatten()
 
+top_term_indices = sample_vector.argsort()[::-1][:15]
+top_term_indices = top_term_indices[sample_vector[top_term_indices] > 0]
+
+top_terms = feature_names[top_term_indices]
+top_weights = sample_vector[top_term_indices]
+
+axes[1].barh(
+    top_terms[::-1],
+    top_weights[::-1],
+    color='#55A868',
+    edgecolor='white'
+)
 
 axes[1].set_title("Top TF-IDF Terms\nfor Sample Item")
 axes[1].set_xlabel("TF-IDF Score")
@@ -211,9 +299,18 @@ plt.show()
 # SECTION 8: Save Artifacts for Lab 2.4
 # ---------------------------------------------------------------------------
 import pickle
+
 # TODO: Save tfidf_matrix, item_ids, vectorizer, and cb_results dictionaries to a pickle file
 # Path: "data/cb_artifacts.pkl"
+cb_artifacts = {
+    'tfidf_matrix': tfidf_matrix,
+    'item_ids': item_ids,
+    'vectorizer': vectorizer,
+    'cb_results': cb_results
+}
 
+with open("data/cb_artifacts.pkl", "wb") as file:
+    pickle.dump(cb_artifacts, file)
 
 print("\n    Saved -> data/cb_artifacts.pkl")
 print("    Move to: 02_collaborative_filtering.py")
